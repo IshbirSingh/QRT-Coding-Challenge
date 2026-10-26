@@ -32,7 +32,7 @@ function solve(grid) {
     const HARD_NO_VALID_MS = 8900;
     const HARD_WITH_VALID_MS = 4700;
     const FIRST_SOLUTION_MS = 6400;
-    const MAX_RESTARTS = 18;
+    const MAX_RESTARTS = 100000;
     const CHECK_EVERY_NODES = 128;
     const IMPROVE_AFTER_FIRST_MS = 1200;
 
@@ -652,8 +652,12 @@ function solve(grid) {
             this.deadlineMs = deadlineMs;
             this.rand = mulberry32(seed);
             this.nodes = 0;
+            this.nodeLimit = Infinity;
             this.bestBound = Infinity;
             this.answer = null;
+            this.timedOut = false;
+            this.stopAttempt = false;
+            this.queuePops = 0;
 
             this.domain = new Uint8Array(this.V);
             this.edges = new Int8Array(this.EN);
@@ -669,6 +673,11 @@ function solve(grid) {
             this.trailOld = [];
             this.queue = [];
             this.inQueue = new Uint8Array(this.V);
+            this.reachSeen = new Int32Array(this.V);
+            this.reachStack = new Int32Array(this.V);
+            this.reachStamp = 1;
+            this.dist = new Int32Array(this.V);
+            this.distQueue = new Int32Array(this.V);
             this.initDomains();
         }
 
@@ -747,8 +756,7 @@ function solve(grid) {
                 else if (type === 4) this.usedCount = old;
                 else if (type === 5) this.onEdges = old;
             }
-            this.queue.length = 0;
-            this.inQueue.fill(0);
+            while (this.queue.length) this.inQueue[this.queue.pop()] = 0;
         }
 
         enqueue(i) {
@@ -895,6 +903,10 @@ function solve(grid) {
 
         propagate() {
             while (this.queue.length) {
+                if (((++this.queuePops) & 1023) === 0 && nowMs() > this.deadlineMs) {
+                    this.timedOut = true;
+                    return false;
+                }
                 const i = this.queue.pop();
                 this.inQueue[i] = 0;
                 if (!this.filterCell(i)) return false;
@@ -1002,26 +1014,48 @@ function solve(grid) {
             return true;
         }
 
-        search(bound) {
+        attempt(seed, nodeLimit, bound, rootMark, deadlineMs) {
+            this.rand = mulberry32(seed);
+            this.nodeLimit = nodeLimit;
             this.bestBound = bound;
-            const mark = this.mark();
-            if (!this.initialPropagate()) {
-                this.undo(mark);
-                return null;
+            this.deadlineMs = deadlineMs;
+            this.nodes = 0;
+            this.queuePops = 0;
+            this.answer = null;
+            this.timedOut = false;
+            this.stopAttempt = false;
+            let thrown = null;
+            let result = null;
+            try {
+                if (this.connectivityCheck()) {
+                    this.dfs();
+                    result = this.answer;
+                }
+            } catch (e) {
+                thrown = e;
             }
-            this.dfs();
-            this.undo(mark);
-            return this.answer;
+            this.undo(rootMark);
+            if (thrown) throw thrown;
+            return result;
         }
 
         dfs() {
             if (this.answer) return true;
-            if ((++this.nodes & (CHECK_EVERY_NODES - 1)) === 0) {
-                if (nowMs() > this.deadlineMs) return false;
+            this.nodes++;
+            if (this.nodes > this.nodeLimit) {
+                this.stopAttempt = true;
+                return false;
+            }
+            if ((this.nodes & 15) === 0 && nowMs() > this.deadlineMs) {
+                this.timedOut = true;
+                return false;
+            }
+            if (!this.connectivityCheck()) return false;
+            if ((this.nodes & (CHECK_EVERY_NODES - 1)) === 0) {
                 if (!this.componentCheck(false)) return false;
             }
 
-            if (this.currentForcedLength() >= this.bestBound) return false;
+            if (this.usedCount >= this.bestBound) return false;
 
             const branch = this.chooseBranch();
             if (!branch) return false;
@@ -1037,7 +1071,7 @@ function solve(grid) {
                         }
                     }
                     this.undo(mark);
-                    if (nowMs() > this.deadlineMs) return false;
+                    if (this.timedOut || this.stopAttempt) return false;
                 }
                 return false;
             }
@@ -1052,7 +1086,7 @@ function solve(grid) {
                     }
                 }
                 this.undo(mark);
-                if (nowMs() > this.deadlineMs) return false;
+                if (this.timedOut || this.stopAttempt) return false;
             }
             return false;
         }
@@ -1061,14 +1095,43 @@ function solve(grid) {
             return Math.max(4, this.pearlCells.length);
         }
 
-        currentForcedLength() {
-            return this.usedCount;
+        connectivityCheck() {
+            if (this.pearlCells.length === 0) return true;
+            const start = this.pearlCells[0];
+            if (this.domain[start] === 1) return false;
+            this.reachStamp++;
+            if (this.reachStamp > 2000000000) {
+                this.reachSeen.fill(0);
+                this.reachStamp = 1;
+            }
+            const stamp = this.reachStamp;
+            let top = 0;
+            let pearlsSeen = 0;
+            this.reachSeen[start] = stamp;
+            this.reachStack[top++] = start;
+            while (top > 0) {
+                const u = this.reachStack[--top];
+                if (this.pearl[u]) pearlsSeen++;
+                for (let d = 0; d < 4; d++) {
+                    const eid = this.edgeId(u, d);
+                    if (eid < 0 || this.edges[eid] === 0) continue;
+                    const v = this.neighbor(u, d);
+                    if (v < 0 || this.domain[v] === 1 || this.reachSeen[v] === stamp) continue;
+                    this.reachSeen[v] = stamp;
+                    this.reachStack[top++] = v;
+                }
+            }
+            return pearlsSeen === this.pearlCells.length;
         }
 
         chooseBranch() {
             let bestCell = -1;
             let bestEdges = null;
             let bestScore = 99;
+            let bestTies = 0;
+            let randomCell = -1;
+            let randomEdges = null;
+            let randomTies = 0;
 
             for (let i = 0; i < this.V; i++) {
                 let on = 0;
@@ -1096,53 +1159,59 @@ function solve(grid) {
                     }
                     if (possible) cand.push(eid);
                 }
-                if (cand.length > 0 && cand.length < bestScore) {
-                    bestCell = i;
-                    bestEdges = cand;
-                    bestScore = cand.length;
-                    if (bestScore === 1) break;
+                if (cand.length > 0) {
+                    if (cand.length <= 3 && this.rand() < 1 / (++randomTies)) {
+                        randomCell = i;
+                        randomEdges = cand;
+                    }
+                    if (cand.length < bestScore) {
+                        bestCell = i;
+                        bestEdges = cand;
+                        bestScore = cand.length;
+                        bestTies = 1;
+                    } else if (cand.length === bestScore && this.rand() < 1 / (++bestTies)) {
+                        bestCell = i;
+                        bestEdges = cand;
+                    }
                 }
             }
+            if (randomCell >= 0 && this.rand() < 0.15) return { kind: 'edge', cell: randomCell, edges: randomEdges };
             if (bestCell >= 0) return { kind: 'edge', cell: bestCell, edges: bestEdges };
 
             let bestDomainCell = -1;
             let bestDomainCount = 99;
+            let bestDomainTies = 0;
             for (const i of this.pearlCells) {
                 const cnt = popcount7(this.domain[i]);
-                if (cnt > 1 && cnt < bestDomainCount) {
+                if (cnt <= 1) continue;
+                if (cnt < bestDomainCount) {
                     bestDomainCell = i;
                     bestDomainCount = cnt;
+                    bestDomainTies = 1;
+                } else if (cnt === bestDomainCount && this.rand() < 1 / (++bestDomainTies)) {
+                    bestDomainCell = i;
                 }
             }
             if (bestDomainCell >= 0) return { kind: 'state', cell: bestDomainCell, states: domainStates(this.domain[bestDomainCell]) };
 
             let bestLooseCell = -1;
             let bestLooseScore = 1e9;
+            let bestLooseTies = 0;
             for (let i = 0; i < this.V; i++) {
                 const cnt = popcount7(this.domain[i]);
                 if (cnt <= 1) continue;
                 const forcedBonus = this.touchesForced(i) ? -1000 : 0;
-                const pearlDist = this.nearestPearlDistance(i);
-                const score = forcedBonus + cnt * 100 + pearlDist;
+                const score = forcedBonus + cnt * 100;
                 if (score < bestLooseScore) {
                     bestLooseScore = score;
+                    bestLooseCell = i;
+                    bestLooseTies = 1;
+                } else if (score === bestLooseScore && this.rand() < 1 / (++bestLooseTies)) {
                     bestLooseCell = i;
                 }
             }
             if (bestLooseCell >= 0) return { kind: 'state', cell: bestLooseCell, states: domainStates(this.domain[bestLooseCell]) };
             return null;
-        }
-
-        nearestPearlDistance(cell) {
-            if (!this.pearlCells.length) return 0;
-            const rc = this.rc(cell);
-            let best = this.R + this.C;
-            for (const p of this.pearlCells) {
-                const pr = Math.floor(p / this.C), pc = p - pr * this.C;
-                const dist = Math.abs(rc[0] - pr) + Math.abs(rc[1] - pc);
-                if (dist < best) best = dist;
-            }
-            return best;
         }
 
         touchesForced(i) {
@@ -1180,21 +1249,79 @@ function solve(grid) {
 
         orderEdges(cell, edges) {
             const arr = edges.slice();
-            arr.sort((a, b) => this.edgeScore(cell, a) - this.edgeScore(cell, b));
-            if (arr.length > 1 && this.rand() < 0.25) arr.reverse();
+            if (arr.length > 1 && this.rand() < 0.15) {
+                for (let i = arr.length - 1; i > 0; i--) {
+                    const j = Math.floor(this.rand() * (i + 1));
+                    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+                }
+                return arr;
+            }
+            this.buildDistanceMap(cell);
+            arr.sort((a, b) => this.edgeDistanceScore(cell, a) - this.edgeDistanceScore(cell, b));
             return arr;
         }
 
-        edgeScore(cell, eid) {
+        edgeDistanceScore(cell, eid) {
             const other = this.otherCell(cell, eid);
-            let score = 10;
-            if (other >= 0 && this.pearl[other]) score -= 5;
-            const rc = this.rc(other >= 0 ? other : cell);
-            const border = Math.min(rc[0], rc[1], this.R - 1 - rc[0], this.C - 1 - rc[1]);
-            score += border * 0.05;
-            score += this.nearestOpenPearlDistance(other >= 0 ? other : cell) * 0.02;
-            score += this.rand() * 0.2;
-            return score;
+            const d = other >= 0 ? this.dist[other] : -1;
+            return (d >= 0 ? d : 1000000) + this.rand() * 1.5;
+        }
+
+        buildDistanceMap(endpoint) {
+            this.dist.fill(-1);
+            let head = 0, tail = 0;
+            const partner = this.partnerEndpoint(endpoint);
+            for (let i = 0; i < this.V; i++) {
+                if (this.deg[i] === 1 && i !== endpoint && i !== partner) {
+                    this.dist[i] = 0;
+                    this.distQueue[tail++] = i;
+                }
+            }
+            for (const p of this.pearlCells) {
+                if (this.deg[p] === 0 && this.dist[p] < 0) {
+                    this.dist[p] = 0;
+                    this.distQueue[tail++] = p;
+                }
+            }
+            if (tail === 0 && partner >= 0) {
+                this.dist[partner] = 0;
+                this.distQueue[tail++] = partner;
+            }
+            while (head < tail) {
+                const u = this.distQueue[head++];
+                const ndist = this.dist[u] + 1;
+                for (let d = 0; d < 4; d++) {
+                    const eid = this.edgeId(u, d);
+                    if (eid < 0 || this.edges[eid] === 0) continue;
+                    const v = this.neighbor(u, d);
+                    if (v < 0 || this.dist[v] >= 0 || this.deg[v] >= 2 || this.domain[v] === 1) continue;
+                    this.dist[v] = ndist;
+                    this.distQueue[tail++] = v;
+                }
+            }
+        }
+
+        partnerEndpoint(endpoint) {
+            let prev = -1;
+            let cur = endpoint;
+            let guard = this.usedCount + 1;
+            while (guard-- > 0) {
+                let next = -1;
+                for (let d = 0; d < 4; d++) {
+                    const eid = this.edgeId(cur, d);
+                    if (eid < 0 || this.edges[eid] !== 1) continue;
+                    const v = this.neighbor(cur, d);
+                    if (v !== prev) {
+                        next = v;
+                        break;
+                    }
+                }
+                if (next < 0) return cur;
+                prev = cur;
+                cur = next;
+                if (cur !== endpoint && this.deg[cur] === 1) return cur;
+            }
+            return -1;
         }
 
         otherCell(cell, eid) {
@@ -1214,24 +1341,6 @@ function solve(grid) {
             if (er === r) return this.idx(r + 1, c);
             if (er + 1 === r) return this.idx(r - 1, c);
             return -1;
-        }
-
-        nearestOpenPearlDistance(cell) {
-            if (cell < 0 || this.pearlCells.length === 0) return 0;
-            const rc = this.rc(cell);
-            let best = this.R + this.C;
-            for (const p of this.pearlCells) {
-                let deg = 0;
-                for (let d = 0; d < 4; d++) {
-                    const eid = this.edgeId(p, d);
-                    if (eid >= 0 && this.edges[eid] === 1) deg++;
-                }
-                if (deg === 2) continue;
-                const pr = Math.floor(p / this.C), pc = p - pr * this.C;
-                const dist = Math.abs(rc[0] - pr) + Math.abs(rc[1] - pc);
-                if (dist < best) best = dist;
-            }
-            return best;
         }
 
         componentCheck(strict) {
@@ -1287,12 +1396,6 @@ function solve(grid) {
             return true;
         }
 
-        tryBuildAnswer() {
-            if (!this.componentCheck(true)) return null;
-            const lines = this.outputFromEdges();
-            return validate(this.grid, lines).ok ? lines : null;
-        }
-
         outputFromEdges() {
             const chars = Array.from({ length: this.R }, () => Array(this.C).fill('.'));
             for (let i = 0; i < this.V; i++) {
@@ -1330,44 +1433,64 @@ function solve(grid) {
     const sparse = pearlCount * 8 < R * C;
     const withValidDeadline = timeBaseMs + (sparse ? HARD_WITH_VALID_MS : Math.min(HARD_WITH_VALID_MS, 2300));
     const globalDeadline = () => best ? Math.min(noValidDeadline, withValidDeadline) : noValidDeadline;
-    const searchDeadline = () => {
-        if (best) return globalDeadline();
-        const reserve = (R * C >= 1600 && pearlCount <= 100) ? 4100 : (pearlCount <= 80 ? 2200 : 700);
-        return Math.max(timeBaseMs + 1000, noValidDeadline - reserve);
-    };
 
-    remember(tryRectangleLoop(grid));
-
-    const earlyPatchBudget = pearlCount <= 120 ? 450 : 300;
-    remember(tryPatchConnector(grid, Math.min(globalDeadline(), nowMs() + earlyPatchBudget), seedBase));
-
-    const attemptBudgets = [180, 260, 380, 560, 820, 1200, 1700, 2400, 3200];
-    for (let restart = 0; restart < MAX_RESTARTS && nowMs() < searchDeadline(); restart++) {
-        const gd = searchDeadline();
-        if (gd - nowMs() < 70) break;
-        const budget = attemptBudgets[Math.min(restart, attemptBudgets.length - 1)];
-        const attemptDeadline = Math.min(gd, nowMs() + budget);
-        const solver = new Solver(grid, seedBase ^ Math.imul(0x9E3779B1, restart + 1), attemptDeadline);
-        const candidate = solver.search(bestLen);
-        remember(candidate);
-        const elapsed = nowMs() - startMs;
-        if (best && (elapsed > FIRST_SOLUTION_MS || globalDeadline() - nowMs() < 120)) break;
-        if (best && elapsed > IMPROVE_AFTER_FIRST_MS && R * C < 600) break;
+    function luby(i) {
+        let k = 1;
+        while ((1 << k) - 1 < i) k++;
+        if (i === (1 << k) - 1) return 1 << (k - 1);
+        return luby(i - (1 << (k - 1)) + 1);
     }
 
-    if (best && nowMs() >= globalDeadline() - 80) {
-        return best;
+    try {
+        remember(tryRectangleLoop(grid));
+    } catch (e) {
     }
 
-    remember(tryPatchConnector(grid, Math.min(noValidDeadline, nowMs() + 650), seedBase ^ 0xA5A5A5A5));
-
-    if (!best && nowMs() < noValidDeadline - 80) {
-        const finalSolver = new Solver(grid, seedBase, Math.min(noValidDeadline, nowMs() + 900));
-        remember(finalSolver.search(Infinity));
+    try {
+        remember(tryPatchConnector(grid, Math.min(globalDeadline(), nowMs() + 250), seedBase));
+    } catch (e) {
     }
 
-    if (best && validate(grid, best).ok) {
-        return best;
+    let solver = null;
+    let rootMark = 0;
+    let rootReady = false;
+    try {
+        solver = new Solver(grid, seedBase, globalDeadline());
+        if (solver.initialPropagate() && solver.connectivityCheck()) {
+            rootMark = solver.mark();
+            rootReady = true;
+        }
+    } catch (e) {
+        rootReady = false;
+    }
+
+    if (rootReady) {
+        const nodeUnit = 300;
+        for (let restart = 1; restart <= MAX_RESTARTS && nowMs() < globalDeadline() - 70; restart++) {
+            const gd = globalDeadline();
+            const nodeLimit = nodeUnit * luby(restart);
+            let candidate = null;
+            try {
+                candidate = solver.attempt(seedBase ^ Math.imul(0x9E3779B1, restart), nodeLimit, bestLen, rootMark, gd);
+                remember(candidate);
+            } catch (e) {
+                try {
+                    solver.undo(rootMark);
+                } catch (ignored) {
+                }
+            }
+            const elapsed = nowMs() - startMs;
+            if (best && (elapsed > FIRST_SOLUTION_MS || globalDeadline() - nowMs() < 120)) break;
+            if (best && elapsed > IMPROVE_AFTER_FIRST_MS && R * C < 600) break;
+        }
+    }
+
+    if (best) {
+        try {
+            if (validate(grid, best).ok) return best;
+        } catch (e) {
+            return best;
+        }
     }
 
     return fallbackGrid(R, C);
