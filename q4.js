@@ -29,12 +29,13 @@ function readLine() {
  * The function accepts STRING_ARRAY grid as parameter.
  */
 function solve(grid) {
-    const HARD_NO_VALID_MS = 8900;
-    const HARD_WITH_VALID_MS = 4700;
-    const FIRST_SOLUTION_MS = 6400;
+    const HARD_LIMIT_MS = 8300;
     const MAX_RESTARTS = 100000;
     const CHECK_EVERY_NODES = 128;
-    const IMPROVE_AFTER_FIRST_MS = 1200;
+    const COMPLETE_NODE_LIMIT = 30000;
+    const COMPLETE_BUDGET_MS = 600;
+    const LNS_BASE_NODES = 500;
+    const LNS_MAX_NODES = 4000;
 
     const N = 1, E = 2, S = 4, W = 8;
     const DIR_BITS = [N, E, S, W];
@@ -46,6 +47,7 @@ function solve(grid) {
     const STATE_MASKS = [0, E | W, N | S, N | E, N | W, S | E, S | W];
     const STATE_CHARS = ['.', '-', '|', 'L', 'J', 'F', '7'];
     const CHAR_TO_MASK = { '.': 0, '-': E | W, '|': N | S, L: N | E, J: N | W, F: S | E, '7': S | W };
+    const CHAR_TO_STATE = { '.': 0, '-': 1, '|': 2, L: 3, J: 4, F: 5, '7': 6 };
     const STATES_WITH = [0, 0, 0, 0];
     const STATES_WITHOUT = [0, 0, 0, 0];
     const TURN_WITH_EDGE = [0, 0, 0, 0];
@@ -65,8 +67,8 @@ function solve(grid) {
         TURN_WITH_EDGE[d] = turnMask;
     }
 
-    function nowMs() {
-        return Date.now();
+    function elapsedMs() {
+        return process.uptime() * 1000;
     }
 
     function popcount7(x) {
@@ -136,8 +138,13 @@ function solve(grid) {
         if (!v.ok) return false;
         const len = loopLength(candidate);
         if (len < bestLen) {
+            const oldLen = bestLen;
             best = candidate;
             bestLen = len;
+            const t = elapsedMs();
+            if (firstSolutionMs < 0) firstSolutionMs = t;
+            lastImproveMs = t;
+            if (oldLen < Infinity && (oldLen - len) / oldLen >= 0.03) lastBigImproveMs = t;
             return true;
         }
         return false;
@@ -179,369 +186,6 @@ function solve(grid) {
             minR = 0; maxR = R - 1; minC = 0; maxC = C - 1;
         }
         return null;
-    }
-
-    function tryPatchConnector(g, deadlineMs, seedBase) {
-        const R = g.length, C = g[0].length, V = R * C;
-        const HN = R * (C - 1);
-        const EN = HN + (R - 1) * C;
-        const pearls = [];
-        const optsByCell = new Map();
-
-        function idx(r, c) { return r * C + c; }
-        function inside(r, c) { return r >= 0 && r < R && c >= 0 && c < C; }
-        function rc(i) { return [Math.floor(i / C), i % C]; }
-        function validMaskAt(id, mask) {
-            const p = rc(id), r = p[0], c = p[1];
-            if ((mask & N) && r === 0) return false;
-            if ((mask & S) && r === R - 1) return false;
-            if ((mask & W) && c === 0) return false;
-            if ((mask & E) && c === C - 1) return false;
-            return true;
-        }
-        function edgeIdFrom(id, d) {
-            const p = rc(id), r = p[0], c = p[1];
-            if (d === 1) return c + 1 < C ? r * (C - 1) + c : -1;
-            if (d === 3) return c > 0 ? r * (C - 1) + c - 1 : -1;
-            if (d === 2) return r + 1 < R ? HN + r * C + c : -1;
-            return r > 0 ? HN + (r - 1) * C + c : -1;
-        }
-        function neighbor(id, d) {
-            const p = rc(id), nr = p[0] + DR[d], nc = p[1] + DC[d];
-            return inside(nr, nc) ? idx(nr, nc) : -1;
-        }
-        function edgeEnds(eid) {
-            if (eid < HN) {
-                const r = Math.floor(eid / (C - 1));
-                const c = eid - r * (C - 1);
-                return [idx(r, c), idx(r, c + 1)];
-            }
-            const k = eid - HN;
-            const r = Math.floor(k / C);
-            const c = k - r * C;
-            return [idx(r, c), idx(r + 1, c)];
-        }
-        function addOption(list, cells) {
-            for (const pair of cells) if (!validMaskAt(pair[0], pair[1])) return;
-            list.push(cells);
-        }
-
-        for (let r = 0; r < R; r++) {
-            for (let c = 0; c < C; c++) {
-                const ch = g[r][c];
-                if (ch !== 'W' && ch !== 'B') continue;
-                const id = idx(r, c);
-                const opts = [];
-                if (ch === 'B') {
-                    for (const mask of [N | E, N | W, S | E, S | W]) {
-                        const cells = [[id, mask]];
-                        let ok = true;
-                        for (let d = 0; d < 4; d++) {
-                            if (!(mask & DIR_BITS[d])) continue;
-                            const n1 = neighbor(id, d), n2 = n1 >= 0 ? neighbor(n1, d) : -1;
-                            if (n1 < 0 || n2 < 0) { ok = false; break; }
-                            cells.push([n1, d === 0 || d === 2 ? N | S : E | W]);
-                        }
-                        if (ok) addOption(opts, cells);
-                    }
-                } else {
-                    const whiteSpecs = [
-                        [E | W, [[3, N | E], [3, S | E], [1, N | W], [1, S | W]]],
-                        [N | S, [[0, S | E], [0, S | W], [2, N | E], [2, N | W]]]
-                    ];
-                    for (const spec of whiteSpecs) {
-                        const pearlMask = spec[0];
-                        for (const turn of spec[1]) {
-                            const n1 = neighbor(id, turn[0]);
-                            if (n1 >= 0) addOption(opts, [[id, pearlMask], [n1, turn[1]]]);
-                        }
-                    }
-                }
-                if (!opts.length) return null;
-                pearls.push(id);
-                optsByCell.set(id, opts);
-            }
-        }
-
-        const ordered = pearls.slice().sort((a, b) => optsByCell.get(a).length - optsByCell.get(b).length);
-        const maxAttempts = Math.max(120, Math.min(1200, 20 + pearls.length * 10));
-        let fixed, edgeOn, deg, rand;
-
-        for (let attempt = 0; attempt < maxAttempts && nowMs() < deadlineMs; attempt++) {
-            rand = mulberry32(seedBase ^ Math.imul(0x85EBCA6B, attempt + 1));
-            let ok = true;
-            if (attempt < 4) {
-                fixed = buildFixedBacktracking(rand, Math.min(deadlineMs, nowMs() + 260));
-                ok = fixed !== null;
-            } else {
-                fixed = new Int8Array(V);
-                fixed.fill(-1);
-                const order = ordered.slice();
-                for (let i = order.length - 1; i > 0; i--) {
-                    if (rand() < 0.28) {
-                        const j = Math.floor(rand() * (i + 1));
-                        const t = order[i]; order[i] = order[j]; order[j] = t;
-                    }
-                }
-                for (const p of order) {
-                    const opts = optsByCell.get(p).slice();
-                    for (let i = opts.length - 1; i > 0; i--) {
-                        const j = Math.floor(rand() * (i + 1));
-                        const t = opts[i]; opts[i] = opts[j]; opts[j] = t;
-                    }
-                    let placed = false;
-                    for (const opt of opts) {
-                        let good = true;
-                        for (const pair of opt) {
-                            if (fixed[pair[0]] !== -1 && fixed[pair[0]] !== pair[1]) {
-                                good = false;
-                                break;
-                            }
-                        }
-                        if (!good) continue;
-                        for (const pair of opt) fixed[pair[0]] = pair[1];
-                        placed = true;
-                        break;
-                    }
-                    if (!placed) { ok = false; break; }
-                }
-            }
-            if (!ok) continue;
-
-            edgeOn = new Uint8Array(EN);
-            deg = new Uint8Array(V);
-            for (let id = 0; id < V && ok; id++) {
-                if (fixed[id] < 0) continue;
-                const mask = fixed[id];
-                for (let d = 0; d < 4; d++) {
-                    if (!(mask & DIR_BITS[d])) continue;
-                    const nb = neighbor(id, d);
-                    const eid = edgeIdFrom(id, d);
-                    if (nb < 0 || eid < 0) { ok = false; break; }
-                    if (fixed[nb] >= 0 && !(fixed[nb] & OPP_BITS[d])) { ok = false; break; }
-                    if (!edgeOn[eid]) {
-                        edgeOn[eid] = 1;
-                        const ab = edgeEnds(eid);
-                        deg[ab[0]]++;
-                        deg[ab[1]]++;
-                        if (deg[ab[0]] > 2 || deg[ab[1]] > 2) { ok = false; break; }
-                    }
-                }
-            }
-            if (!ok) continue;
-
-            const lines = connectEndpointPaths(edgeOn, deg, fixed, rand);
-            if (lines && validate(g, lines).ok) return lines;
-        }
-        return null;
-
-        function buildFixedBacktracking(localRand, localDeadline) {
-            const out = new Int8Array(V);
-            out.fill(-1);
-            const assigned = new Uint8Array(pearls.length);
-            const pos = new Map();
-            for (let i = 0; i < pearls.length; i++) pos.set(pearls[i], i);
-            let nodes = 0;
-
-            function compatible(opt) {
-                for (const pair of opt) {
-                    if (out[pair[0]] !== -1 && out[pair[0]] !== pair[1]) return false;
-                }
-                return true;
-            }
-
-            function place(opt, changed) {
-                for (const pair of opt) {
-                    if (out[pair[0]] === -1) {
-                        out[pair[0]] = pair[1];
-                        changed.push(pair[0]);
-                    }
-                }
-            }
-
-            function undo(changed) {
-                for (let i = changed.length - 1; i >= 0; i--) out[changed[i]] = -1;
-            }
-
-            function dfs(done) {
-                if ((++nodes & 255) === 0 && nowMs() > localDeadline) return false;
-                if (done === pearls.length) return true;
-                let bestIdx = -1, bestOpts = null, bestCount = 99;
-                for (let i = 0; i < pearls.length; i++) {
-                    if (assigned[i]) continue;
-                    const p = pearls[i];
-                    const opts = optsByCell.get(p);
-                    const good = [];
-                    for (const opt of opts) if (compatible(opt)) good.push(opt);
-                    if (good.length === 0) return false;
-                    if (good.length < bestCount || (good.length === bestCount && localRand() < 0.35)) {
-                        bestCount = good.length;
-                        bestIdx = i;
-                        bestOpts = good;
-                        if (bestCount === 1) break;
-                    }
-                }
-                for (let i = bestOpts.length - 1; i > 0; i--) {
-                    const j = Math.floor(localRand() * (i + 1));
-                    const t = bestOpts[i]; bestOpts[i] = bestOpts[j]; bestOpts[j] = t;
-                }
-                assigned[bestIdx] = 1;
-                for (const opt of bestOpts) {
-                    const changed = [];
-                    place(opt, changed);
-                    if (dfs(done + 1)) return true;
-                    undo(changed);
-                }
-                assigned[bestIdx] = 0;
-                return false;
-            }
-
-            return dfs(0) ? out : null;
-        }
-
-        function canUseEdge(id, d, target) {
-            const nb = neighbor(id, d);
-            const eid = edgeIdFrom(id, d);
-            if (nb < 0 || eid < 0 || edgeOn[eid]) return false;
-            if (deg[id] >= 2 || deg[nb] >= 2) return false;
-            if (fixed[id] >= 0 && !(fixed[id] & DIR_BITS[d])) return false;
-            if (fixed[nb] >= 0 && !(fixed[nb] & OPP_BITS[d])) return false;
-            if (deg[nb] === 1 && nb !== target) return false;
-            if (deg[nb] === 2) return false;
-            return true;
-        }
-
-        function addEdge(eid) {
-            if (edgeOn[eid]) return;
-            edgeOn[eid] = 1;
-            const ab = edgeEnds(eid);
-            deg[ab[0]]++;
-            deg[ab[1]]++;
-        }
-
-        function components() {
-            const comp = new Int32Array(V);
-            comp.fill(-1);
-            const endpoints = [];
-            let compCnt = 0;
-            const stack = [];
-            for (let i = 0; i < V; i++) {
-                if (deg[i] === 1) endpoints.push(i);
-                if (deg[i] === 0 || comp[i] !== -1) continue;
-                comp[i] = compCnt;
-                stack.push(i);
-                while (stack.length) {
-                    const u = stack.pop();
-                    for (let d = 0; d < 4; d++) {
-                        const eid = edgeIdFrom(u, d);
-                        if (eid < 0 || !edgeOn[eid]) continue;
-                        const v = neighbor(u, d);
-                        if (v >= 0 && comp[v] === -1) {
-                            comp[v] = compCnt;
-                            stack.push(v);
-                        }
-                    }
-                }
-                compCnt++;
-            }
-            return { comp, endpoints, compCnt };
-        }
-
-        function findPath(a, b) {
-            const prev = new Int32Array(V);
-            const prevDir = new Int8Array(V);
-            prev.fill(-2);
-            const q = new Int32Array(V);
-            let head = 0, tail = 0;
-            q[tail++] = a;
-            prev[a] = -1;
-            while (head < tail) {
-                const u = q[head++];
-                if (u === b) break;
-                const dirs = [0, 1, 2, 3];
-                for (let i = 3; i > 0; i--) {
-                    const j = Math.floor(rand() * (i + 1));
-                    const t = dirs[i]; dirs[i] = dirs[j]; dirs[j] = t;
-                }
-                for (const d of dirs) {
-                    if (!canUseEdge(u, d, b)) continue;
-                    const v = neighbor(u, d);
-                    if (prev[v] !== -2) continue;
-                    prev[v] = u;
-                    prevDir[v] = d;
-                    q[tail++] = v;
-                }
-            }
-            if (prev[b] === -2) return null;
-            const pathEdges = [];
-            let cur = b;
-            while (cur !== a) {
-                const p = prev[cur];
-                pathEdges.push(edgeIdFrom(p, prevDir[cur]));
-                cur = p;
-            }
-            pathEdges.reverse();
-            return pathEdges;
-        }
-
-        function connectEndpointPaths() {
-            let guard = V + pearls.length * 8;
-            while (guard-- > 0 && nowMs() < deadlineMs) {
-                const info = components();
-                const endpoints = info.endpoints;
-                if (endpoints.length === 0) return outputLines();
-                if (endpoints.length < 2 || endpoints.length % 2) return null;
-
-                let pairs = [];
-                for (let i = 0; i < endpoints.length; i++) {
-                    for (let j = i + 1; j < endpoints.length; j++) {
-                        const a = endpoints[i], b = endpoints[j];
-                        const same = info.comp[a] === info.comp[b];
-                        if (same && endpoints.length > 2) continue;
-                        const ar = Math.floor(a / C), ac = a - ar * C;
-                        const br = Math.floor(b / C), bc = b - br * C;
-                        pairs.push([Math.abs(ar - br) + Math.abs(ac - bc) + rand() * 0.5, a, b]);
-                    }
-                }
-                if (rand() < 0.35) {
-                    for (let i = pairs.length - 1; i > 0; i--) {
-                        const j = Math.floor(rand() * (i + 1));
-                        const t = pairs[i]; pairs[i] = pairs[j]; pairs[j] = t;
-                    }
-                } else {
-                    pairs.sort((x, y) => x[0] - y[0]);
-                }
-                let path = null;
-                const pairLimit = Math.min(pairs.length, 120);
-                for (let i = 0; i < pairLimit; i++) {
-                    path = findPath(pairs[i][1], pairs[i][2]);
-                    if (path) break;
-                }
-                if (!path) return null;
-                for (const eid of path) addEdge(eid);
-                for (let i = 0; i < V; i++) if (deg[i] > 2) return null;
-            }
-            return null;
-        }
-
-        function outputLines() {
-            const chars = Array.from({ length: R }, () => Array(C).fill('.'));
-            for (let id = 0; id < V; id++) {
-                let mask = 0;
-                for (let d = 0; d < 4; d++) {
-                    const eid = edgeIdFrom(id, d);
-                    if (eid >= 0 && edgeOn[eid]) mask |= DIR_BITS[d];
-                }
-                for (let s = 0; s < STATE_MASKS.length; s++) {
-                    if (STATE_MASKS[s] === mask) {
-                        const p = rc(id);
-                        chars[p[0]][p[1]] = STATE_CHARS[s];
-                        break;
-                    }
-                }
-            }
-            return chars.map(row => row.join(''));
-        }
     }
 
     function validate(g, outLines) {
@@ -658,6 +302,7 @@ function solve(grid) {
             this.timedOut = false;
             this.stopAttempt = false;
             this.queuePops = 0;
+            this.lastExhausted = false;
 
             this.domain = new Uint8Array(this.V);
             this.edges = new Int8Array(this.EN);
@@ -678,25 +323,57 @@ function solve(grid) {
             this.reachStamp = 1;
             this.dist = new Int32Array(this.V);
             this.distQueue = new Int32Array(this.V);
+            this.nbrTab = new Int32Array(this.V * 4);
+            this.eidTab = new Int32Array(this.V * 4);
+            this.edgeA = new Int32Array(this.EN);
+            this.edgeB = new Int32Array(this.EN);
+            this.buildTables();
             this.initDomains();
         }
 
+        buildTables() {
+            this.nbrTab.fill(-1);
+            this.eidTab.fill(-1);
+            for (let r = 0; r < this.R; r++) {
+                for (let c = 0; c < this.C; c++) {
+                    const i = r * this.C + c;
+                    for (let d = 0; d < 4; d++) {
+                        const nr = r + DR[d], nc = c + DC[d];
+                        const k = i * 4 + d;
+                        if (nr < 0 || nr >= this.R || nc < 0 || nc >= this.C) continue;
+                        this.nbrTab[k] = nr * this.C + nc;
+                        if (d === 1) this.eidTab[k] = r * (this.C - 1) + c;
+                        else if (d === 3) this.eidTab[k] = r * (this.C - 1) + c - 1;
+                        else if (d === 2) this.eidTab[k] = this.HN + r * this.C + c;
+                        else this.eidTab[k] = this.HN + (r - 1) * this.C + c;
+                    }
+                }
+            }
+            for (let r = 0; r < this.R; r++) {
+                for (let c = 0; c + 1 < this.C; c++) {
+                    const eid = r * (this.C - 1) + c;
+                    this.edgeA[eid] = r * this.C + c;
+                    this.edgeB[eid] = r * this.C + c + 1;
+                }
+            }
+            for (let r = 0; r + 1 < this.R; r++) {
+                for (let c = 0; c < this.C; c++) {
+                    const eid = this.HN + r * this.C + c;
+                    this.edgeA[eid] = r * this.C + c;
+                    this.edgeB[eid] = (r + 1) * this.C + c;
+                }
+            }
+        }
+
         idx(r, c) { return r * this.C + c; }
-        rc(i) { return [Math.floor(i / this.C), i % this.C]; }
         inBounds(r, c) { return r >= 0 && r < this.R && c >= 0 && c < this.C; }
 
         neighbor(i, d) {
-            const r = Math.floor(i / this.C), c = i - r * this.C;
-            const nr = r + DR[d], nc = c + DC[d];
-            return this.inBounds(nr, nc) ? nr * this.C + nc : -1;
+            return this.nbrTab[i * 4 + d];
         }
 
         edgeId(i, d) {
-            const r = Math.floor(i / this.C), c = i - r * this.C;
-            if (d === 1) return c + 1 < this.C ? r * (this.C - 1) + c : -1;
-            if (d === 3) return c > 0 ? r * (this.C - 1) + c - 1 : -1;
-            if (d === 2) return r + 1 < this.R ? this.HN + r * this.C + c : -1;
-            return r > 0 ? this.HN + (r - 1) * this.C + c : -1;
+            return this.eidTab[i * 4 + d];
         }
 
         initDomains() {
@@ -778,9 +455,8 @@ function solve(grid) {
             let a = -1, b = -1;
             let closesCycle = false;
             if (val === 1) {
-                const ends = this.edgeEnds(eid);
-                a = ends[0];
-                b = ends[1];
+                a = this.edgeA[eid];
+                b = this.edgeB[eid];
                 if (this.deg[a] >= 2 || this.deg[b] >= 2) return false;
                 if (this.deg[a] === 1 && this.deg[b] === 1) {
                     const info = this.pathInfo(a, b);
@@ -803,18 +479,8 @@ function solve(grid) {
                 if (!this.used[b]) this.setUsed(b, 1);
                 if (this.deg[a] > 2 || this.deg[b] > 2) return false;
             }
-            if (eid < this.HN) {
-                const r = Math.floor(eid / (this.C - 1));
-                const c = eid - r * (this.C - 1);
-                this.enqueueAroundCell(this.idx(r, c));
-                this.enqueueAroundCell(this.idx(r, c + 1));
-            } else {
-                const k = eid - this.HN;
-                const r = Math.floor(k / this.C);
-                const c = k - r * this.C;
-                this.enqueueAroundCell(this.idx(r, c));
-                this.enqueueAroundCell(this.idx(r + 1, c));
-            }
+            this.enqueueAroundCell(this.edgeA[eid]);
+            this.enqueueAroundCell(this.edgeB[eid]);
             if (closesCycle) {
                 const lines = this.outputFromEdges();
                 if (!validate(this.grid, lines).ok) return false;
@@ -824,15 +490,7 @@ function solve(grid) {
         }
 
         edgeEnds(eid) {
-            if (eid < this.HN) {
-                const r = Math.floor(eid / (this.C - 1));
-                const c = eid - r * (this.C - 1);
-                return [this.idx(r, c), this.idx(r, c + 1)];
-            }
-            const k = eid - this.HN;
-            const r = Math.floor(k / this.C);
-            const c = k - r * this.C;
-            return [this.idx(r, c), this.idx(r + 1, c)];
+            return [this.edgeA[eid], this.edgeB[eid]];
         }
 
         setScalar(type, old) {
@@ -903,7 +561,7 @@ function solve(grid) {
 
         propagate() {
             while (this.queue.length) {
-                if (((++this.queuePops) & 1023) === 0 && nowMs() > this.deadlineMs) {
+                if (((++this.queuePops) & 1023) === 0 && elapsedMs() > this.deadlineMs) {
                     this.timedOut = true;
                     return false;
                 }
@@ -1024,6 +682,7 @@ function solve(grid) {
             this.answer = null;
             this.timedOut = false;
             this.stopAttempt = false;
+            this.lastExhausted = false;
             let thrown = null;
             let result = null;
             try {
@@ -1031,6 +690,51 @@ function solve(grid) {
                     this.dfs();
                     result = this.answer;
                 }
+                this.lastExhausted = !this.answer && !this.stopAttempt && !this.timedOut;
+            } catch (e) {
+                thrown = e;
+            }
+            this.undo(rootMark);
+            if (thrown) throw thrown;
+            return result;
+        }
+
+        attemptWindow(seed, nodeLimit, bound, rootMark, deadlineMs, r0, r1, c0, c1, bestState) {
+            this.rand = mulberry32(seed);
+            this.nodeLimit = nodeLimit;
+            this.bestBound = bound;
+            this.deadlineMs = deadlineMs;
+            this.nodes = 0;
+            this.queuePops = 0;
+            this.answer = null;
+            this.timedOut = false;
+            this.stopAttempt = false;
+            this.lastExhausted = false;
+            let thrown = null;
+            let result = null;
+            try {
+                let ok = true;
+                let checked = 0;
+                for (let r = 0; r < this.R && ok; r++) {
+                    for (let c = 0; c < this.C; c++) {
+                        if (r >= r0 && r <= r1 && c >= c0 && c <= c1) continue;
+                        const i = r * this.C + c;
+                        if (!this.restrictDomain(i, 1 << bestState[i])) {
+                            ok = false;
+                            break;
+                        }
+                        if (((++checked) & 255) === 0 && elapsedMs() > this.deadlineMs) {
+                            this.timedOut = true;
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if (ok && this.propagate() && this.connectivityCheck()) {
+                    this.dfs();
+                    result = this.answer;
+                }
+                this.lastExhausted = !this.answer && !this.stopAttempt && !this.timedOut;
             } catch (e) {
                 thrown = e;
             }
@@ -1046,7 +750,7 @@ function solve(grid) {
                 this.stopAttempt = true;
                 return false;
             }
-            if ((this.nodes & 15) === 0 && nowMs() > this.deadlineMs) {
+            if ((this.nodes & 15) === 0 && elapsedMs() > this.deadlineMs) {
                 this.timedOut = true;
                 return false;
             }
@@ -1065,7 +769,7 @@ function solve(grid) {
                 for (const s of vals) {
                     const mark = this.mark();
                     if (this.restrictDomain(branch.cell, 1 << s) && this.propagate() && this.dfs()) {
-                        if (this.answer || nowMs() > this.deadlineMs || this.bestBound <= this.lowerPearlBound()) {
+                        if (this.answer || elapsedMs() > this.deadlineMs || this.bestBound <= this.lowerPearlBound()) {
                             this.undo(mark);
                             return true;
                         }
@@ -1080,7 +784,7 @@ function solve(grid) {
             for (const eid of edges) {
                 const mark = this.mark();
                 if (this.setEdge(eid, 1) && this.propagate() && this.dfs()) {
-                    if (this.answer || nowMs() > this.deadlineMs || this.bestBound <= this.lowerPearlBound()) {
+                    if (this.answer || elapsedMs() > this.deadlineMs || this.bestBound <= this.lowerPearlBound()) {
                         this.undo(mark);
                         return true;
                     }
@@ -1325,21 +1029,8 @@ function solve(grid) {
         }
 
         otherCell(cell, eid) {
-            const r = Math.floor(cell / this.C), c = cell - r * this.C;
-            if (eid < this.HN) {
-                const er = Math.floor(eid / (this.C - 1));
-                const ec = eid - er * (this.C - 1);
-                if (er !== r) return -1;
-                if (ec === c) return this.idx(r, c + 1);
-                if (ec + 1 === c) return this.idx(r, c - 1);
-                return -1;
-            }
-            const k = eid - this.HN;
-            const er = Math.floor(k / this.C);
-            const ec = k - er * this.C;
-            if (ec !== c) return -1;
-            if (er === r) return this.idx(r + 1, c);
-            if (er + 1 === r) return this.idx(r - 1, c);
+            if (this.edgeA[eid] === cell) return this.edgeB[eid];
+            if (this.edgeB[eid] === cell) return this.edgeA[eid];
             return -1;
         }
 
@@ -1348,17 +1039,7 @@ function solve(grid) {
             let onEdges = 0;
             for (let e = 0; e < this.EN; e++) {
                 if (this.edges[e] !== 1) continue;
-                let a, b;
-                if (e < this.HN) {
-                    const r = Math.floor(e / (this.C - 1));
-                    const c = e - r * (this.C - 1);
-                    a = this.idx(r, c); b = this.idx(r, c + 1);
-                } else {
-                    const k = e - this.HN;
-                    const r = Math.floor(k / this.C);
-                    const c = k - r * this.C;
-                    a = this.idx(r, c); b = this.idx(r + 1, c);
-                }
+                const a = this.edgeA[e], b = this.edgeB[e];
                 onEdges++;
                 deg[a]++; deg[b]++;
                 if (deg[a] > 2 || deg[b] > 2) return false;
@@ -1420,19 +1101,26 @@ function solve(grid) {
     const C = grid[0] ? grid[0].length : 0;
     if (!R || !C) return [];
 
-    const startMs = nowMs();
-    const timeBaseMs = PROGRAM_START_MS;
-    const noValidDeadline = timeBaseMs + HARD_NO_VALID_MS;
+    const hardDeadline = HARD_LIMIT_MS;
     const seedBase = hashGrid(grid);
     let best = null;
     let bestLen = Infinity;
+    let firstSolutionMs = -1;
+    let lastImproveMs = -1;
+    let lastBigImproveMs = -1;
     let pearlCount = 0;
+    const pearlIds = new Int32Array(R * C);
     for (const row of grid) {
         for (let i = 0; i < row.length; i++) if (row[i] === 'W' || row[i] === 'B') pearlCount++;
     }
-    const sparse = pearlCount * 8 < R * C;
-    const withValidDeadline = timeBaseMs + (sparse ? HARD_WITH_VALID_MS : Math.min(HARD_WITH_VALID_MS, 2300));
-    const globalDeadline = () => best ? Math.min(noValidDeadline, withValidDeadline) : noValidDeadline;
+    let pearlAt = 0;
+    for (let r = 0; r < R; r++) {
+        for (let c = 0; c < C; c++) {
+            if (grid[r][c] === 'W' || grid[r][c] === 'B') pearlIds[pearlAt++] = r * C + c;
+        }
+    }
+    const globalDeadline = () => hardDeadline;
+    const lowerBound = () => Math.max(4, pearlCount);
 
     function luby(i) {
         let k = 1;
@@ -1441,13 +1129,43 @@ function solve(grid) {
         return luby(i - (1 << (k - 1)) + 1);
     }
 
-    try {
-        remember(tryRectangleLoop(grid));
-    } catch (e) {
+    function softCap() {
+        const base = R * C < 400 ? 1300 : (R * C < 1200 ? 2500 : 4000);
+        if (lastBigImproveMs >= 0 && elapsedMs() - lastBigImproveMs <= 500) return 5200;
+        return base;
+    }
+
+    function improvementWindowOpen() {
+        if (firstSolutionMs < 0 || lastImproveMs < 0) return false;
+        const stagMs = Math.max(350, 0.4 * (elapsedMs() - firstSolutionMs));
+        return elapsedMs() - lastImproveMs <= stagMs && elapsedMs() < softCap() && elapsedMs() < hardDeadline - 70;
+    }
+
+    function fullRestartWindowOpen() {
+        if (!best) return elapsedMs() < hardDeadline - 70;
+        if (bestLen <= lowerBound()) return false;
+        const t = elapsedMs();
+        if (t >= hardDeadline - 70 || t >= softCap()) return false;
+        if (firstSolutionMs >= 0 && t - firstSolutionMs < 900) return true;
+        return improvementWindowOpen();
+    }
+
+    function buildBestState(out, state, loopCells) {
+        let count = 0;
+        for (let r = 0; r < R; r++) {
+            const row = out[r];
+            for (let c = 0; c < C; c++) {
+                const i = r * C + c;
+                const s = CHAR_TO_STATE[row[c]];
+                state[i] = s;
+                if (s !== 0) loopCells[count++] = i;
+            }
+        }
+        return count;
     }
 
     try {
-        remember(tryPatchConnector(grid, Math.min(globalDeadline(), nowMs() + 250), seedBase));
+        remember(tryRectangleLoop(grid));
     } catch (e) {
     }
 
@@ -1464,10 +1182,11 @@ function solve(grid) {
         rootReady = false;
     }
 
+    let optimal = bestLen <= lowerBound();
     if (rootReady) {
         const nodeUnit = 300;
-        for (let restart = 1; restart <= MAX_RESTARTS && nowMs() < globalDeadline() - 70; restart++) {
-            const gd = globalDeadline();
+        for (let restart = 1; restart <= MAX_RESTARTS && fullRestartWindowOpen(); restart++) {
+            const gd = best ? Math.min(hardDeadline, softCap()) : globalDeadline();
             const nodeLimit = nodeUnit * luby(restart);
             let candidate = null;
             try {
@@ -1479,9 +1198,109 @@ function solve(grid) {
                 } catch (ignored) {
                 }
             }
-            const elapsed = nowMs() - startMs;
-            if (best && (elapsed > FIRST_SOLUTION_MS || globalDeadline() - nowMs() < 120)) break;
-            if (best && elapsed > IMPROVE_AFTER_FIRST_MS && R * C < 600) break;
+            if (bestLen <= lowerBound()) {
+                optimal = true;
+                break;
+            }
+            if (solver.lastExhausted) {
+                if (best) optimal = true;
+                break;
+            }
+        }
+    }
+
+    optimal = optimal || bestLen <= lowerBound();
+    if (rootReady && best && !optimal && improvementWindowOpen()) {
+        for (let rounds = 0; rounds < 8 && elapsedMs() < hardDeadline - 70; rounds++) {
+            const before = bestLen;
+            let candidate = null;
+            try {
+                candidate = solver.attempt(seedBase ^ Math.imul(0xC2B2AE35, rounds + 1),
+                    COMPLETE_NODE_LIMIT, bestLen, rootMark, Math.min(hardDeadline, elapsedMs() + COMPLETE_BUDGET_MS));
+                remember(candidate);
+            } catch (e) {
+                try {
+                    solver.undo(rootMark);
+                } catch (ignored) {
+                }
+            }
+            if (solver.lastExhausted || bestLen <= lowerBound()) {
+                optimal = true;
+                break;
+            }
+            if (bestLen >= before) break;
+        }
+    }
+
+    if (rootReady && best && !optimal) {
+        const bestState = new Uint8Array(R * C);
+        const loopCells = new Int32Array(R * C);
+        let loopCount = buildBestState(best, bestState, loopCells);
+        let rand = mulberry32(seedBase ^ 0xD1B54A32);
+        let wMax = 10;
+        let stale = 0;
+        let truncStale = 0;
+        let windowNodes = LNS_BASE_NODES;
+        let windows = 0;
+        while (loopCount > 0 && improvementWindowOpen() && windows < 100000) {
+            windows++;
+            let center;
+            if (pearlCount > 0 && rand() < 0.5) center = pearlIds[Math.floor(rand() * pearlCount)];
+            else center = loopCells[Math.floor(rand() * loopCount)];
+            const cr = Math.floor(center / C), cc = center - cr * C;
+            const h = Math.min(R, 6 + Math.floor(rand() * Math.max(1, wMax - 5)));
+            const w = Math.min(C, 6 + Math.floor(rand() * Math.max(1, wMax - 5)));
+            let r0 = cr - Math.floor(h / 2), c0 = cc - Math.floor(w / 2);
+            if (r0 < 0) r0 = 0;
+            if (c0 < 0) c0 = 0;
+            let r1 = r0 + h - 1, c1 = c0 + w - 1;
+            if (r1 >= R) { r1 = R - 1; r0 = Math.max(0, r1 - h + 1); }
+            if (c1 >= C) { c1 = C - 1; c0 = Math.max(0, c1 - w + 1); }
+
+            let hasLoop = false;
+            for (let r = r0; r <= r1 && !hasLoop; r++) {
+                for (let c = c0; c <= c1; c++) {
+                    if (bestState[r * C + c] !== 0) {
+                        hasLoop = true;
+                        break;
+                    }
+                }
+            }
+            if (!hasLoop) continue;
+
+            const before = bestLen;
+            try {
+                const candidate = solver.attemptWindow(seedBase ^ Math.imul(0x85EBCA6B, windows),
+                    windowNodes, bestLen, rootMark, hardDeadline, r0, r1, c0, c1, bestState);
+                remember(candidate);
+            } catch (e) {
+                try {
+                    solver.undo(rootMark);
+                } catch (ignored) {
+                }
+            }
+            if (bestLen < before) {
+                loopCount = buildBestState(best, bestState, loopCells);
+                wMax = 10;
+                stale = 0;
+                truncStale = 0;
+                windowNodes = LNS_BASE_NODES;
+                if (bestLen <= lowerBound()) {
+                    optimal = true;
+                    break;
+                }
+            } else {
+                stale++;
+                if (solver.timedOut || solver.stopAttempt) truncStale++;
+                if (stale >= 15) {
+                    wMax = Math.min(24, wMax + 2);
+                    stale = 0;
+                }
+                if (truncStale >= 8) {
+                    windowNodes = Math.min(LNS_MAX_NODES, windowNodes * 2);
+                    truncStale = 0;
+                }
+            }
         }
     }
 
@@ -1497,8 +1316,6 @@ function solve(grid) {
 }
 
 function main() {
-    const ws = fs.createWriteStream(process.env.OUTPUT_PATH);
-
     const rows = inputString.map(s => String(s).trim()).filter(Boolean);
     const gridCount = parseInt(rows[0], 10);
     let grid = rows.slice(1, 1 + gridCount);
@@ -1510,7 +1327,6 @@ function main() {
         result = Array.from({ length: isFinite(gridCount) ? gridCount : 0 }, () => '.'.repeat(width));
     }
 
-    ws.write(result.join('\n') + '\n');
-    ws.end();
+    fs.writeFileSync(process.env.OUTPUT_PATH, result.join('\n') + '\n');
 }
 
